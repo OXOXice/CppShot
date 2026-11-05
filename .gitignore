@@ -1,0 +1,37 @@
+# 本地环境 / 构建产物
+.buildtools/
+.buildtmp/
+.buildfix/
+.wheels/
+.build/
+.temp/
+.testtmp/
+.testbuild*/
+.appdata*/
+.*home*/
+*shots*/
+.acl-recovery/
+.artifacts/
+.runtmp/
+tmp*/
+__pycache__/
+*.py[cod]
+build/
+dist/
+release/
+*.spec
+
+# 本地开发辅助（不进入仓库）
+pipwrap.py
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 用户数据
+*.log
+config.json
+session.json
