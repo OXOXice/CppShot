@@ -17,6 +17,8 @@ from .ai import (
     test_connection,
 )
 from .documents import clean_doc_text, looks_like_cpp, read_document, split_code_locally
+from .imaging import save_screenshot
+from .models import CodeItem
 from .theme import (
     MONO_FAMILY,
     UI_FAMILY,
@@ -25,6 +27,7 @@ from .theme import (
     copy_to_clipboard,
     set_dark_titlebar,
 )
+from .toolchain import Compiler, InteractiveProcess, PreparedProgram, prepare_interactive
 from .widgets import run_async
 
 
@@ -442,6 +445,309 @@ class AIResultDialog(BaseDialog):
             return
         self.replace_callback(self.code)
         self.close()
+
+
+class InteractiveRunDialog(BaseDialog):
+    """编译后在应用内实时运行，允许用户按行输入 stdin。"""
+
+    def __init__(self, app, item: CodeItem, compiler: Compiler) -> None:
+        super().__init__(app.root, "交互运行", 980, 720)
+        self.app = app
+        self.item = item
+        self.compiler = compiler
+        self.process: InteractiveProcess | None = None
+        self.prepared: PreparedProgram | None = None
+        self._transcript = ""
+        self._finished = False
+        self._closed = False
+        self._auto_saved = False
+        self._exit_code: int | None = None
+        self._poll_job: str | None = None
+        self._stopped = False
+        self._notified_closed = False
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
+        self.bind("<Escape>", lambda _e: self._request_close())
+
+        self.add_heading(
+            "交互运行 · 实时输入",
+            "程序运行时会实时显示输出；在下方输入框按 Enter，把一行数据发送给 cin。\n"
+            "程序正常结束后会自动保存一张包含输入和输出的截图。",
+        )
+        tk.Label(
+            self.body,
+            text=f"当前程序：{item.name or '未命名'}    ·    编译器：{compiler.short_label}",
+            bg=Theme.BG, fg=Theme.MUTED, font=(UI_FAMILY, 9), anchor="w",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.body.grid_columnconfigure(0, weight=1)
+        self.body.grid_rowconfigure(1, weight=1)
+
+        console_frame = tk.Frame(self.body, bg=Theme.EDITOR_BG,
+                                 highlightbackground=Theme.BORDER, highlightthickness=1)
+        console_frame.grid(row=1, column=0, sticky="nsew")
+        console_frame.grid_rowconfigure(0, weight=1)
+        console_frame.grid_columnconfigure(0, weight=1)
+        self.console = tk.Text(
+            console_frame, bg=Theme.EDITOR_BG, fg="#D6E2F0",
+            insertbackground=Theme.ACCENT, selectbackground=Theme.SELECT,
+            selectforeground=Theme.TEXT, font=(MONO_FAMILY, 10), bd=0,
+            highlightthickness=0, padx=14, pady=12, wrap="word",
+            state="disabled",
+        )
+        console_scroll = ttk.Scrollbar(console_frame, orient="vertical",
+                                       command=self.console.yview)
+        self.console.configure(yscrollcommand=console_scroll.set)
+        self.console.grid(row=0, column=0, sticky="nsew")
+        console_scroll.grid(row=0, column=1, sticky="ns")
+        self.console.tag_configure("info", foreground=Theme.FAINT)
+        self.console.tag_configure("error", foreground="#FCA5A5")
+        self.console.tag_configure("ok", foreground=Theme.GREEN)
+        self.console.tag_configure("input", foreground=Theme.ACCENT)
+        self._append_ui("[CppShot] 正在准备编译器，请稍候…\n", "info")
+
+        input_row = tk.Frame(self.body, bg=Theme.BG)
+        input_row.grid(row=2, column=0, sticky="ew", pady=(10, 5))
+        input_row.grid_columnconfigure(1, weight=1)
+        self.prompt_label = tk.Label(input_row, text="›", bg=Theme.PANEL_ALT,
+                                     fg=Theme.GREEN, font=(MONO_FAMILY, 14, "bold"),
+                                     padx=10, pady=6)
+        self.prompt_label.grid(row=0, column=0, sticky="ns")
+        self.input_var = tk.StringVar()
+        self.input_entry = tk.Entry(
+            input_row, textvariable=self.input_var, bg=Theme.PANEL_ALT, fg=Theme.TEXT,
+            insertbackground=Theme.ACCENT, disabledbackground=Theme.PANEL_ALT,
+            disabledforeground=Theme.FAINT, relief="flat", highlightthickness=1,
+            highlightbackground=Theme.BORDER, highlightcolor=Theme.ACCENT,
+            font=(MONO_FAMILY, 12), bd=0, state="disabled",
+        )
+        self.input_entry.grid(row=0, column=1, sticky="ew", ipady=7)
+        self.send_button = ttk.Button(input_row, text="发送", style="Primary.TButton",
+                                      command=self._send_line, state="disabled")
+        self.send_button.grid(row=0, column=2, padx=(8, 0))
+        self.input_entry.bind("<Return>", self._send_line)
+
+        self.status_label = tk.Label(self.body, text="正在编译…", bg=Theme.BG,
+                                     fg=Theme.ACCENT, font=(UI_FAMILY, 9), anchor="w")
+        self.status_label.grid(row=3, column=0, sticky="ew")
+
+        self.stop_button = self.add_footer_button(
+            "停止运行", self._stop, style="Danger.TButton", side="left", padx=(0, 0)
+        )
+        self.stop_button.state(["disabled"])
+        self.close_button = self.add_footer_button("关闭", self._request_close,
+                                                   side="right", padx=(8, 0))
+        self.save_button = self.add_footer_button("保存截图", self._manual_save,
+                                                  side="right")
+        self.save_button.state(["disabled"])
+
+        run_async(
+            self,
+            lambda: prepare_interactive(self.item, self.compiler),
+            self._compiled,
+            self._compile_exception,
+        )
+
+    # ------------------------------------------------------------------ UI helpers
+    def _append_ui(self, text: str, tag: str | None = None) -> None:
+        if self._closed:
+            return
+        try:
+            self.console.configure(state="normal")
+            self.console.insert("end", text, tag or ())
+            self.console.configure(state="disabled")
+            self.console.see("end")
+        except tk.TclError:
+            pass
+
+    def _append_program(self, text: str) -> None:
+        if not text:
+            return
+        self._transcript += text
+        self._append_ui(text)
+
+    def _set_status(self, text: str, color: str = Theme.MUTED) -> None:
+        try:
+            self.status_label.configure(text=text, fg=color)
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------ compile
+    def _compiled(self, prepared: PreparedProgram) -> None:
+        if self._closed or not self.winfo_exists():
+            prepared.cleanup()
+            return
+        self.prepared = prepared
+        if not prepared.ok:
+            self._finished = True
+            self._exit_code = prepared.exit_code
+            self._append_ui("\n[CppShot] 编译失败。\n", "error")
+            detail = prepared.output.strip() or prepared.error.strip()
+            if detail:
+                self._append_ui(detail + "\n", "error")
+            self._set_status("编译失败，没有生成截图。", Theme.RED)
+            self.app.on_interactive_result(
+                self.item.id, "failed", prepared.exit_code, self._transcript, "", prepared.error
+            )
+            return
+        self._append_ui("[CppShot] 编译成功，程序开始运行。\n", "ok")
+        try:
+            self.process = InteractiveProcess(prepared)
+        except Exception as exc:
+            self._finished = True
+            self._append_ui(f"[CppShot] 无法启动程序：{exc}\n", "error")
+            self._set_status("启动失败，没有生成截图。", Theme.RED)
+            self.app.on_interactive_result(
+                self.item.id, "failed", None, self._transcript, "",
+                f"无法启动程序：{type(exc).__name__}: {exc}",
+            )
+            prepared.cleanup()
+            self.prepared = None
+            return
+        self.input_entry.configure(state="normal")
+        self.send_button.configure(state="normal")
+        self.stop_button.state(["!disabled"])
+        self._set_status("运行中 · 输入一行后按 Enter 发送", Theme.GREEN)
+        self.input_entry.focus_set()
+        self._poll()
+
+    def _compile_exception(self, exc: Exception) -> None:
+        if self._closed and not self.winfo_exists():
+            return
+        self._finished = True
+        self._append_ui(f"\n[CppShot] 编译环境异常：{type(exc).__name__}: {exc}\n", "error")
+        self._set_status("编译环境异常，没有生成截图。", Theme.RED)
+        self.app.on_interactive_result(
+            self.item.id, "failed", None, self._transcript, "",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    # ------------------------------------------------------------------ live loop
+    def _poll(self) -> None:
+        self._poll_job = None
+        if self._closed or not self.winfo_exists():
+            return
+        exit_code: int | None = None
+        if self.process is not None:
+            while True:
+                try:
+                    kind, value = self.process.events.get_nowait()
+                except Exception:
+                    break
+                if kind == "output":
+                    self._append_program(str(value))
+                elif kind == "exit":
+                    exit_code = int(value) if value is not None else None
+                    break
+        if exit_code is not None:
+            self._on_exit(exit_code)
+            return
+        if self.process is not None and not self._finished:
+            self._poll_job = self.after(60, self._poll)
+
+    def _send_line(self, _event=None) -> str:
+        if self.process is None or not self.process.running:
+            return "break"
+        text = self.input_var.get()
+        self._transcript += text + "\n"
+        self._append_ui(text + "\n", "input")
+        self.input_var.set("")
+        self.process.write_line(text)
+        self.input_entry.focus_set()
+        return "break"
+
+    def _on_exit(self, exit_code: int) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._exit_code = exit_code
+        try:
+            self.input_entry.configure(state="disabled")
+            self.send_button.configure(state="disabled")
+            self.stop_button.state(["disabled"])
+        except tk.TclError:
+            pass
+        if exit_code == 0:
+            self._append_ui("\n[CppShot] 程序正常结束，退出代码 0。\n", "ok")
+            self._set_status("运行成功，正在保存截图…", Theme.GREEN)
+            self._save(auto=True)
+        else:
+            self._append_ui(f"\n[CppShot] 程序结束，退出代码 {exit_code}，未自动生成截图。\n",
+                            "error")
+            self._set_status(f"运行结束，退出代码 {exit_code}；失败结果不截图。", Theme.RED)
+            self.app.on_interactive_result(
+                self.item.id, "failed", exit_code, self._transcript, "",
+                f"程序退出代码 {exit_code}",
+            )
+
+    def _save(self, auto: bool = False) -> str | None:
+        if not self._transcript.strip():
+            self._set_status("没有程序输出，无法截图。", Theme.RED)
+            return None
+        try:
+            path = save_screenshot(
+                self.item, self._transcript, self.app.config.save_dir,
+                self.compiler.label,
+            )
+        except Exception as exc:
+            self._set_status(f"截图保存失败：{exc}", Theme.RED)
+            self.app.on_interactive_result(
+                self.item.id, "failed", self._exit_code, self._transcript, "",
+                f"截图保存失败：{type(exc).__name__}: {exc}",
+            )
+            return None
+        self._auto_saved = True
+        self.save_button.state(["!disabled"])
+        self._append_ui(f"\n[CppShot] 截图已保存：{path}\n", "ok")
+        self._set_status(f"运行成功 · 截图：{path.name}", Theme.GREEN)
+        self.app.on_interactive_result(
+            self.item.id, "success", self._exit_code, self._transcript, str(path), ""
+        )
+        return str(path)
+
+    def _manual_save(self) -> None:
+        if self._finished and self._exit_code == 0:
+            self._save(auto=False)
+
+    def _stop(self) -> None:
+        if self.process is None or not self.process.running:
+            return
+        self._stopped = True
+        self.stop_button.state(["disabled"])
+        self.input_entry.configure(state="disabled")
+        self.send_button.configure(state="disabled")
+        self._set_status("正在停止程序…", Theme.YELLOW)
+        self.process.stop()
+
+    def _request_close(self) -> None:
+        if self._closed:
+            return
+        if self.process is not None and self.process.running:
+            if not messagebox.askyesno(
+                "程序仍在运行",
+                "程序还没有结束。停止它并关闭交互窗口吗？\n本次不会自动生成截图。",
+                parent=self,
+            ):
+                return
+        self._closed = True
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
+            self._poll_job = None
+        if self.process is not None:
+            self.process.cleanup()
+            self.process = None
+        elif self.prepared is not None:
+            self.prepared.cleanup()
+            self.prepared = None
+        if not self._notified_closed:
+            self._notified_closed = True
+            self.app.on_interactive_closed()
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
 
 
 class FailureDialog(BaseDialog):

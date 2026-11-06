@@ -11,6 +11,7 @@ CppShot 面向刚学 C++、需要频繁提交“运行截图”的同学：
 - 一次粘贴多份代码，或一次导入多个 `.cpp` 文件
 - 在程序内直接修改代码、填写 `cin` 输入
 - 批量编译运行，自动保存 CMD 风格的 PNG 截图
+- **交互运行**：程序实时输出，可边跑边输入，正常结束自动截图
 - 遇到编译错误、非 0 退出码、超时自动中止，后续代码不再截图
 - 截图保存位置可自定义，一键复制路径
 - 可选 AI：诊断代码、按题目/Word 生成代码、从 Word/TXT 中拆分多段代码
@@ -22,7 +23,7 @@ CppShot 面向刚学 C++、需要频繁提交“运行截图”的同学：
 在 GitHub Releases 下载 `CppShot-*-Windows-Portable.zip`：
 
 1. 解压到任意目录（不要只把 exe 单独拖出来，它旁边的 `_internal` 文件夹也要保留）。
-2. 双击 `启动 CppShot.vbs`，或直接双击 `CppShot.exe`。
+2. 双击 `启动 CppShot.vbs`（推荐，会自动使用程序目录内的数据和临时目录）。
 3. 不需要安装 Python。
 
 > 首次运行 Windows SmartScreen 可能提示“未知发布者”。项目目前没有代码签名证书，选择“更多信息 → 仍要运行”即可。介意的话请从源码运行或自行构建。
@@ -66,13 +67,15 @@ CppShot 是“编译运行 + 截图”的图形前端，不内置编译器。第
    - “导入 CPP”可多选 `.cpp` 文件；
    - AI 生成/拆题会作为新条目加入左侧队列。
 2. **填写运行输入**（可选）
-   - 程序里有 `cin` 时，在“运行输入（stdin）”按行填写，例如 `12 30`。
+   - 程序里有 `cin` 时，在“运行输入（stdin）”按行填写，例如 `12 30`；
+   - 或者使用 **交互运行**：编译后打开实时控制台，在下方输入框按 Enter，把输入一行行送进程序，像 CMD 一样。
 3. **截图保存位置**
    - 默认在桌面 `C++运行截图`；
    - 点“选择文件夹”修改，“复制路径”一键复制。
 4. **运行**
-   - “运行当前并截图”只跑当前条目；
+   - “运行当前并截图”只跑当前条目，并自动使用运行输入；
    - “批量运行全部并截图”按队列顺序执行；
+   - “交互运行（边跑边输入）”打开实时控制台，适合需要多轮输入、边看提示边输入的程序；正常结束后自动保存包含输入的截图；
    - 也可以按 `Ctrl+Enter` / `Ctrl+Shift+Enter`。
 5. **失败处理**
    - 编译失败、程序返回非 0、超时都会立即中止；
@@ -88,6 +91,10 @@ CppShot 是“编译运行 + 截图”的图形前端，不内置编译器。第
 生成的实际截图示例（由真实运行输出绘制）：
 
 ![运行截图示例](docs/output-example.png)
+
+交互运行会把用户输入也保留在截图里：
+
+![交互运行截图](docs/interactive-example.png)
 
 ## 关于“截图”
 
@@ -171,7 +178,7 @@ python app.py --selftest
 ```bash
 git init
 git add .
-git commit -m "feat: CppShot v1.0.0"
+git commit -m "feat: CppShot v1.1.0"
 git branch -M main
 git remote add origin https://github.com/OXOXice/CppShot.git
 git push -u origin main
@@ -180,8 +187,8 @@ git push -u origin main
 打标签即可让 Actions 自动构建三端产物并创建 Release：
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 详见 [发布说明](docs/github-release.md)。

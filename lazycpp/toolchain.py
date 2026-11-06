@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import codecs
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -407,10 +410,14 @@ def compile_and_run(item: CodeItem, compiler: Compiler, timeout_sec: int = 15) -
     compiler_label = compiler.label
     try:
         source_path.write_bytes(_source_with_encoding(item.code, compiler))
+        compile_tmp = build_dir / "tmp"
+        compile_tmp.mkdir(exist_ok=True)
         original_dir = Path(item.source_path).parent if item.source_path else None
         run_cwd = original_dir if original_dir and original_dir.is_dir() else build_dir
         if compiler.kind == "msvc":
             env = _msvc_environment(compiler)
+            for key in ("TMP", "TEMP", "TMPDIR"):
+                env[key] = str(compile_tmp)
             cl_path = shutil.which("cl", path=env.get("PATH")) or shutil.which("cl", path=next(
                 (v for k, v in env.items() if k.upper() == "PATH"), ""))
             if not cl_path:
@@ -445,6 +452,8 @@ def compile_and_run(item: CodeItem, compiler: Compiler, timeout_sec: int = 15) -
                 )
         else:
             env = os.environ.copy()
+            for key in ("TMP", "TEMP", "TMPDIR"):
+                env[key] = str(compile_tmp)
             gxx = compiler.executable or shutil.which("g++")
             if not gxx:
                 raise RuntimeError("找不到 g++")
@@ -480,6 +489,8 @@ def compile_and_run(item: CodeItem, compiler: Compiler, timeout_sec: int = 15) -
             gxx = compiler.executable or shutil.which("g++")
             if gxx:
                 run_env["PATH"] = str(Path(gxx).parent) + os.pathsep + run_env.get("PATH", "")
+        for key in ("TMP", "TEMP", "TMPDIR"):
+            run_env[key] = str(compile_tmp)
         stdin_text = item.stdin
         if stdin_text and not stdin_text.endswith("\n"):
             stdin_text += "\n"
@@ -549,3 +560,211 @@ def compile_and_run(item: CodeItem, compiler: Compiler, timeout_sec: int = 15) -
         )
     finally:
         _cleanup_build(build_dir)
+
+
+# ---------------------------------------------------------------------------
+# 交互运行：编译一次，进程保持运行，stdin 由界面逐行写入。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PreparedProgram:
+    ok: bool
+    exe_path: str = ""
+    build_dir: str = ""
+    cwd: str = ""
+    env: dict[str, str] = field(default_factory=dict)
+    label: str = ""
+    encoding: str = "utf-8"
+    command: str = ""
+    elapsed: float = 0.0
+    output: str = ""
+    error: str = ""
+    exit_code: int | None = None
+    stage: str = "compile"
+
+    def cleanup(self) -> None:
+        if self.build_dir:
+            _cleanup_build(Path(self.build_dir))
+            self.build_dir = ""
+
+
+def prepare_interactive(item: CodeItem, compiler: Compiler) -> PreparedProgram:
+    """编译程序但暂不运行，返回一个可由 InteractiveProcess 启动的句柄。"""
+    started = time.perf_counter()
+    build_dir = _build_workdir(item)
+    source_path = build_dir / "main.cpp"
+    exe_path = build_dir / ("program.exe" if sys.platform == "win32" else "program")
+    compiler_label = compiler.label
+    command_text = ""
+    try:
+        tmp_dir = build_dir / "tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        source_path.write_bytes(_source_with_encoding(item.code, compiler))
+        original_dir = Path(item.source_path).parent if item.source_path else None
+        run_cwd = original_dir if original_dir and original_dir.is_dir() else build_dir
+        if compiler.kind == "msvc":
+            env = _msvc_environment(compiler)
+            cl_path = shutil.which("cl", path=env.get("PATH")) or shutil.which(
+                "cl", path=next((v for k, v in env.items() if k.upper() == "PATH"), "")
+            )
+            if not cl_path:
+                root = Path(compiler.vcvars).parent.parent.parent if compiler.vcvars else None
+                if root:
+                    matches = list(root.glob("Tools/MSVC/*/bin/Hostx64/x64/cl.exe"))
+                    cl_path = str(matches[-1]) if matches else None
+                if not cl_path:
+                    raise RuntimeError("找到了 Visual Studio，但找不到 cl.exe")
+            args = [cl_path, "/nologo", "/EHsc", "/W3"]
+            if compiler.utf8_flag:
+                args.append("/utf-8")
+            if compiler.cxx17_flag:
+                args.append("/std:c++17")
+            args.extend([f"/Fe{exe_path}", str(source_path)])
+            if original_dir:
+                args.insert(3, f"/I{original_dir}")
+            command_text = "cl /nologo /EHsc /W3 " + (
+                "/utf-8 " if compiler.utf8_flag else ""
+            ) + ("/std:c++17 " if compiler.cxx17_flag else "") + "/Fe:program.exe main.cpp"
+            for key in ("TMP", "TEMP", "TMPDIR"):
+                env[key] = str(tmp_dir)
+            result = _run_hidden(args, timeout=90, env=env, cwd=str(build_dir))
+            encoding = "gb18030" if not compiler.utf8_flag else "utf-8"
+        else:
+            env = os.environ.copy()
+            gxx = compiler.executable or shutil.which("g++")
+            if not gxx:
+                raise RuntimeError("找不到 g++")
+            if str(Path(gxx).parent) not in env.get("PATH", ""):
+                env["PATH"] = str(Path(gxx).parent) + os.pathsep + env.get("PATH", "")
+            args = [gxx, "-std=c++17", "-O0", "-pipe", "-fdiagnostics-color=never",
+                    "-o", str(exe_path), str(source_path)]
+            if original_dir:
+                args.insert(1, f"-I{original_dir}")
+            command_text = "g++ -std=c++17 -O0 -o program.exe main.cpp"
+            for key in ("TMP", "TEMP", "TMPDIR"):
+                env[key] = str(tmp_dir)
+            result = _run_hidden(args, timeout=90, env=env, cwd=str(build_dir))
+            encoding = "utf-8"
+        compile_output = _decode(result.stdout)
+        if result.returncode != 0 or not exe_path.exists():
+            _cleanup_build(build_dir)
+            return PreparedProgram(
+                ok=False, build_dir="", label=compiler_label, encoding=encoding,
+                command=command_text, elapsed=time.perf_counter() - started,
+                output=compile_output, stage="compile", exit_code=result.returncode,
+                error=compile_output.strip() or "编译器没有输出具体信息。",
+            )
+        return PreparedProgram(
+            ok=True, exe_path=str(exe_path), build_dir=str(build_dir),
+            cwd=str(run_cwd), env=env, label=compiler_label, encoding=encoding,
+            command=command_text, elapsed=time.perf_counter() - started,
+            output=compile_output,
+        )
+    except subprocess.TimeoutExpired:
+        _cleanup_build(build_dir)
+        return PreparedProgram(
+            ok=False, label=compiler_label, command=command_text, stage="compile",
+            elapsed=time.perf_counter() - started,
+            error="编译超时（超过 90 秒），已中止。",
+        )
+    except Exception as exc:
+        _cleanup_build(build_dir)
+        return PreparedProgram(
+            ok=False, label=compiler_label, command=command_text, stage="prepare",
+            elapsed=time.perf_counter() - started,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+class InteractiveProcess:
+    """保持子进程运行，通过队列把实时输出交给 Tk 主线程。"""
+
+    def __init__(self, prepared: PreparedProgram) -> None:
+        self.prepared = prepared
+        self.events: queue.Queue = queue.Queue()
+        self._closed = False
+        self._reader: threading.Thread | None = None
+        self.process = subprocess.Popen(
+            [prepared.exe_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=prepared.cwd or None,
+            env=prepared.env,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _read_loop(self) -> None:
+        decoder = codecs.getincrementaldecoder(self.prepared.encoding)(errors="replace")
+        fd = self.process.stdout.fileno() if self.process.stdout else -1
+        try:
+            while fd >= 0:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if text:
+                    self.events.put(("output", text))
+            rest = decoder.decode(b"", final=True)
+            if rest:
+                self.events.put(("output", rest))
+        except OSError:
+            pass
+        try:
+            code = self.process.wait()
+        except Exception:
+            code = self.process.poll()
+        self.events.put(("exit", code))
+
+    @property
+    def running(self) -> bool:
+        return self.process.poll() is None
+
+    def write_line(self, text: str) -> bool:
+        if self.process.poll() is not None or self.process.stdin is None:
+            return False
+        try:
+            self.process.stdin.write((text + "\n").encode(self.prepared.encoding, errors="replace"))
+            self.process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+    def stop(self) -> None:
+        if self.process.poll() is not None:
+            return
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW, timeout=8,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                self.process.kill()
+            except OSError:
+                pass
+        try:
+            if self.process.stdin:
+                self.process.stdin.close()
+        except OSError:
+            pass
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.stop()
+        try:
+            if self.process.stdout:
+                self.process.stdout.close()
+        except OSError:
+            pass
+        self.prepared.cleanup()
+

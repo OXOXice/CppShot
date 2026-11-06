@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import APP_TITLE, __version__
 from .ai import AIConfig, AIError, ai_diagnose
 from .config import Store, initial_items
-from .dialogs import AIGenerateDialog, AIResultDialog, FailureDialog, SettingsDialog
+from .dialogs import AIGenerateDialog, AIResultDialog, FailureDialog, InteractiveRunDialog, SettingsDialog
 from .imaging import open_path, save_screenshot
 from .models import CodeItem, DEFAULT_CODE, STATUS_LABELS, safe_filename, unique_name
 from .theme import (
@@ -69,6 +69,7 @@ class CppShotApp:
         self._run_successes: list[str] = []
         self._run_indices: list[int] = []
         self._ai_busy = False
+        self.interactive_dialog: InteractiveRunDialog | None = None
         self._compiler_label_to_id: dict[str, str] = {}
         self._compiler_id_to_label: dict[str, str] = {}
 
@@ -418,7 +419,15 @@ class CppShotApp:
         self.run_current_button.pack(fill="x")
         self.run_all_button = ttk.Button(inner, text="批量运行全部并截图",
                                          style="Secondary.TButton", command=self.run_all)
-        self.run_all_button.pack(fill="x", pady=(6, 10))
+        self.run_all_button.pack(fill="x", pady=(6, 6))
+        self.run_interactive_button = ttk.Button(
+            inner, text="交互运行（边跑边输入）", style="Secondary.TButton",
+            command=self.run_interactive_current,
+        )
+        self.run_interactive_button.pack(fill="x", pady=(0, 8))
+        tk.Label(inner, text="交互模式适合需要边运行边输入的程序；正常结束会自动截图。",
+                 bg=Theme.PANEL, fg=Theme.FAINT, font=(UI_FAMILY, 8), anchor="w",
+                 justify="left", wraplength=self.px(290)).pack(fill="x", pady=(0, 8))
 
         settings = tk.Frame(inner, bg=Theme.PANEL)
         settings.pack(fill="x")
@@ -984,6 +993,78 @@ class CppShotApp:
         self._sync_current()
         self._start_run(list(range(len(self.items))), batch=True)
 
+    def run_interactive_current(self) -> None:
+        """打开实时交互控制台，边运行边输入。"""
+        if self._busy or not self.items:
+            return
+        self._sync_current()
+        compiler = self._resolve_compiler()
+        if compiler is None:
+            self._warn_no_compiler()
+            return
+        item = self._current_item()
+        if item is None or not item.code.strip():
+            messagebox.showwarning("代码为空", "当前条目没有可运行的代码。", parent=self.root)
+            return
+        save_dir = Path(self.config.save_dir).expanduser()
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            probe = save_dir / ".cppshot_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            messagebox.showerror(
+                "截图目录不可写",
+                f"无法写入：{save_dir}\n{exc}\n\n请在右侧重新选择一个保存位置。",
+                parent=self.root,
+            )
+            return
+        snapshot = copy.deepcopy(item)
+        self._set_busy(True)
+        try:
+            dialog = InteractiveRunDialog(self, snapshot, compiler)
+            self.interactive_dialog = dialog
+            self.log(f"▶ 交互运行：{item.name or '未命名'} · {compiler.short_label}", "accent")
+        except Exception as exc:
+            self._set_busy(False)
+            messagebox.showerror("无法打开交互运行", f"{type(exc).__name__}: {exc}",
+                                 parent=self.root)
+
+    def on_interactive_result(self, item_id: str, status: str, exit_code: int | None,
+                              transcript: str, image_path: str, error: str) -> None:
+        index = next((i for i, item in enumerate(self.items) if item.id == item_id), None)
+        if index is None:
+            return
+        item = self.items[index]
+        item.status = status
+        item.last_exit_code = exit_code
+        item.last_output = transcript
+        item.last_error = error
+        if image_path:
+            item.last_image = image_path
+            self.config.last_screenshot = image_path
+            self.store.save_config(self.config)
+            self._update_last_screenshot()
+            self.log(
+                f"✓ 交互运行完成：{item.name or '未命名'} · 截图 {Path(image_path).name}",
+                "ok",
+            )
+            self.toast(f"交互截图已保存：{Path(image_path).name}")
+        else:
+            message = error.strip().splitlines()[0] if error.strip() else "交互运行失败"
+            self.log(f"✕ 交互运行失败：{item.name or '未命名'} · {message}", "fail")
+        self._update_tree_row(index)
+        if index == self.current_index:
+            self._update_status_pill()
+        self._schedule_session_save()
+
+    def on_interactive_closed(self) -> None:
+        self.interactive_dialog = None
+        if self._busy:
+            self._set_busy(False)
+        self._update_action_states()
+        self.log("交互运行窗口已关闭。", "info")
+
     def _start_run(self, indices: list[int], *, batch: bool) -> None:
         if self._busy or not indices:
             return
@@ -1074,7 +1155,7 @@ class CppShotApp:
         for button in (
             self.new_button, self.import_button, self.delete_button, self.clear_button,
             self.up_button, self.down_button, self.run_current_button, self.run_all_button,
-            self.diagnose_button, self.generate_button,
+            self.run_interactive_button, self.diagnose_button, self.generate_button,
         ):
             button.configure(state=state)
         self.compiler_combo.configure(state="disabled" if busy else "readonly")
@@ -1393,6 +1474,7 @@ class CppShotApp:
         can_run = has_items and has_compiler and not self._busy
         self.run_current_button.configure(state="normal" if can_run else "disabled")
         self.run_all_button.configure(state="normal" if can_run else "disabled")
+        self.run_interactive_button.configure(state="normal" if can_run else "disabled")
         self.delete_button.configure(state="normal" if has_items and not self._busy else "disabled")
         self.copy_code_button.configure(state="normal" if has_items else "disabled")
         self.export_button.configure(state="normal" if has_items else "disabled")
